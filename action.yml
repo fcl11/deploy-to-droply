@@ -1,0 +1,87 @@
+name: Deploy to droply
+description: Publish a folder (a static site, a report, docs) to droply and get a droply.page link.
+author: droply
+branding:
+  icon: upload-cloud
+  color: green
+
+inputs:
+  api-key:
+    description: Your droply API key (drp_...). Store it as a repository secret. Needs the Plus plan or higher.
+    required: true
+  name:
+    description: Project name. The site goes live at https://<name>.droply.page. If you already have a project with this name, it is updated and the link stays the same.
+    required: true
+  path:
+    description: Folder to publish. Run your build first. The folder needs an index.html at the top.
+    required: false
+    default: "."
+  password:
+    description: Optional. Visitors must enter this password. Only used when the project is first created.
+    required: false
+    default: ""
+
+outputs:
+  url:
+    description: The live link, e.g. https://my-site.droply.page
+    value: ${{ steps.deploy.outputs.url }}
+  id:
+    description: The droply project id
+    value: ${{ steps.deploy.outputs.id }}
+
+runs:
+  using: composite
+  steps:
+    - id: deploy
+      shell: bash
+      env:
+        DROPLY_API_KEY: ${{ inputs.api-key }}
+        DROPLY_NAME: ${{ inputs.name }}
+        DROPLY_PATH: ${{ inputs.path }}
+        DROPLY_PASSWORD: ${{ inputs.password }}
+        DROPLY_API: https://droply.so/api/v1
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::$1"; exit 1; }
+
+        [ -n "$DROPLY_API_KEY" ] || fail "api-key is empty. Add your droply API key as a secret and pass it as api-key."
+        echo "::add-mask::$DROPLY_API_KEY"
+        NAME="$(printf '%s' "$DROPLY_NAME" | tr '[:upper:]' '[:lower:]')"
+        [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$ ]] || fail "name must be 3-40 characters: lowercase letters, numbers and dashes."
+        [ -d "$DROPLY_PATH" ] || fail "Folder not found: $DROPLY_PATH"
+        [ -f "$DROPLY_PATH/index.html" ] || echo "::warning::No index.html at the top of $DROPLY_PATH. The link may not open a web page."
+
+        ZIP="$RUNNER_TEMP/droply-site.zip"
+        rm -f "$ZIP"
+        (cd "$DROPLY_PATH" && zip -qr "$ZIP" . -x '.*' -x '*/.*' -x 'node_modules/*')
+        echo "Zipped $(du -h "$ZIP" | cut -f1) from $DROPLY_PATH"
+
+        call() { # method, path, extra curl args...
+          local method="$1" path="$2"; shift 2
+          local out="$RUNNER_TEMP/droply-res.json"
+          local code
+          code=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" "$DROPLY_API$path" \
+            -H "Authorization: Bearer $DROPLY_API_KEY" "$@") || fail "Couldn't reach droply.so."
+          if [ "$code" -ge 300 ]; then
+            fail "droply answered $code: $(jq -r '.error // "request failed"' "$out" 2>/dev/null || cat "$out")"
+          fi
+          cat "$out"
+        }
+
+        ID="$(call GET /sites | jq -r --arg n "$NAME" '.sites[] | select(.name == $n) | .id' | head -n1)"
+        if [ -n "$ID" ]; then
+          RES="$(call PUT "/sites/$ID/files" -F "files=@$ZIP;type=application/zip")"
+          echo "Updated $NAME"
+        else
+          args=(-F "files=@$ZIP;type=application/zip" --form-string "name=$NAME")
+          [ -n "$DROPLY_PASSWORD" ] && args+=(--form-string "password=$DROPLY_PASSWORD")
+          RES="$(call POST /sites "${args[@]}")"
+          echo "Created $NAME"
+        fi
+
+        URL="$(printf '%s' "$RES" | jq -r '.site.url')"
+        ID="$(printf '%s' "$RES" | jq -r '.site.id')"
+        echo "url=$URL" >> "$GITHUB_OUTPUT"
+        echo "id=$ID" >> "$GITHUB_OUTPUT"
+        echo "### Published to droply: $URL" >> "$GITHUB_STEP_SUMMARY"
+        echo "Live at $URL"
