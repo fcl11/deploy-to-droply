@@ -61,21 +61,24 @@ runs:
           local out="$RUNNER_TEMP/droply-res.json"
           local code
           code=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" "$DROPLY_API$path" \
-            -H "Authorization: Bearer $DROPLY_API_KEY" "$@") || fail "Couldn't reach droply.so."
+            -H "Authorization: Bearer $DROPLY_API_KEY" "$@") || { echo "Couldn't reach droply.so." > "$RUNNER_TEMP/droply-err"; return 1; }
           if [ "$code" -ge 300 ]; then
-            fail "droply answered $code: $(jq -r '.error // "request failed"' "$out" 2>/dev/null || cat "$out")"
+            echo "droply answered $code: $(jq -r '.error // "request failed"' "$out" 2>/dev/null || head -c 300 "$out")" > "$RUNNER_TEMP/droply-err"
+            return 1
           fi
           cat "$out"
         }
 
-        ID="$(call GET /sites | jq -r --arg n "$NAME" '.sites[] | select(.name == $n) | .id' | head -n1)"
+        apierr() { fail "$(cat "$RUNNER_TEMP/droply-err" 2>/dev/null || echo "request failed")"; }
+        LIST="$(call GET /sites)" || apierr
+        ID="$(printf '%s' "$LIST" | jq -r --arg n "$NAME" '.sites[] | select(.name == $n) | .id' | head -n1)"
         if [ -n "$ID" ]; then
-          RES="$(call PUT "/sites/$ID/files" -F "files=@$ZIP;type=application/zip")"
+          RES="$(call PUT "/sites/$ID/files" -F "files=@$ZIP;type=application/zip")" || apierr
           echo "Updated $NAME"
         else
           args=(-F "files=@$ZIP;type=application/zip" --form-string "name=$NAME")
           [ -n "$DROPLY_PASSWORD" ] && args+=(--form-string "password=$DROPLY_PASSWORD")
-          RES="$(call POST /sites "${args[@]}")"
+          RES="$(call POST /sites "${args[@]}")" || apierr
           echo "Created $NAME"
         fi
 
